@@ -58,6 +58,7 @@ class RobotEnv:
         # Для награды
         self.prev_distance = None
         self.step_count = 0
+        self.no_progress_steps = 0
 
         self.reset()
 
@@ -78,26 +79,11 @@ class RobotEnv:
         p.resetSimulation(physicsClientId=self.client)
         p.setGravity(0, 0, -9.81, physicsClientId=self.client)
 
-        #КРУТЕЙШИЙ ПОЛ
-        ground_half = [10.0, 10.0, 0.1]
-        ground_col = p.createCollisionShape(
-            shapeType=p.GEOM_BOX,
-            halfExtents=ground_half,
-            physicsClientId=self.client
-        )
-        ground_vis = p.createVisualShape(
-            shapeType=p.GEOM_BOX,
-            halfExtents=ground_half,
-            rgbaColor=[0.5, 0.5, 0.5, 1.0],
-            physicsClientId=self.client
-        )
-        self.ground_id = p.createMultiBody(
-            baseMass=0.0,
-            baseCollisionShapeIndex=ground_col,
-            baseVisualShapeIndex=ground_vis,
-            basePosition=[0.0, 0.0, -ground_half[2]],
-            physicsClientId=self.client
-        )
+        # стандартный плоский пол из pybullet_data
+        import pybullet_data
+
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        self.ground_id = p.loadURDF("plane.urdf", physicsClientId=self.client)
 
         self._create_three_sphere_robot()
 
@@ -126,6 +112,7 @@ class RobotEnv:
 
         self.prev_distance = self._compute_distance_to_target()
         self.step_count = 0
+        self.no_progress_steps = 0
 
     def _create_three_sphere_robot(self):
         import pybullet_data
@@ -265,36 +252,13 @@ class RobotEnv:
         # Новое наблюдение
         obs, dist_new = self._compute_obs()
 
-        # --------- НАГРАДА ---------
         prev_dist = self.prev_distance
         self.prev_distance = dist_new
 
         progress = prev_dist - dist_new   # >0, если приблизились
-        reward = 8.0 * progress
-        reward -= 0.01
+        reward, done, info = self._compute_reward(progress, dist_new, prev_dist, abs(v_l - v_r))
 
-        # Штраф за АФК: большая разница между скоростями колёс (крутится)
-        turn_penalty = abs(v_l - v_r)
-        reward -= 0.0005 * turn_penalty
-
-        done = False
-        info = {}
-
-        if dist_new - prev_dist > 0.03:
-            reward -= 0.5
-
-
-        if dist_new < 0.4:
-            reward += 50.0
-            done = True
-            info["success"] = True
-        else:
-            info["success"] = False
-
-        if self.step_count >= self.max_steps:
-            done = True
-
-        return obs, float(reward), done, info
+        return obs, reward, done, info
 
 
 class RobotVisionEnv(RobotEnv):
@@ -332,6 +296,10 @@ class RobotVisionEnv(RobotEnv):
         self._load_scene()
         first_frame = self._render_camera()
         self._init_frame_stack(first_frame)
+        self._perform_initial_spin()
+        self.prev_distance = self._compute_distance_to_target()
+        self.no_progress_steps = 0
+        obs, _ = self._compute_obs(latest_frame=None, append=False)
         self.prev_distance = self._compute_distance_to_target()
         obs, _ = self._compute_obs(latest_frame=first_frame, append=False)
         return obs
@@ -373,6 +341,39 @@ class RobotVisionEnv(RobotEnv):
         else:
             frame = rgb / 255.0
         return frame.astype(np.float32)
+
+    def _perform_initial_spin(self):
+        """Повернуть камеру на 360° перед тем, как агент начнёт действовать."""
+        spin_steps = 24
+        start_yaw = self.yaw
+        base_z = 0.04
+
+        for i in range(spin_steps):
+            angle = start_yaw + 2 * math.pi * (i + 1) / spin_steps
+            self.yaw = angle
+            base_pos = [self.x, self.y, base_z]
+            base_orn = p.getQuaternionFromEuler([0, 0, self.yaw])
+            p.resetBasePositionAndOrientation(
+                self.robot_id,
+                base_pos,
+                base_orn,
+                physicsClientId=self.client,
+            )
+            p.stepSimulation(physicsClientId=self.client)
+            self.frames.append(self._render_camera())
+
+        # Вернуться к исходной ориентации
+        self.yaw = start_yaw
+        base_pos = [self.x, self.y, base_z]
+        base_orn = p.getQuaternionFromEuler([0, 0, self.yaw])
+        p.resetBasePositionAndOrientation(
+            self.robot_id,
+            base_pos,
+            base_orn,
+            physicsClientId=self.client,
+        )
+        p.stepSimulation(physicsClientId=self.client)
+        self.frames.append(self._render_camera())
 
     def _compute_obs(self, latest_frame: Optional[np.ndarray] = None, append: bool = True):
         frame = latest_frame if latest_frame is not None else self._render_camera()
@@ -433,6 +434,9 @@ class RobotVisionEnv(RobotEnv):
         self.prev_distance = dist_new
 
         progress = prev_dist - dist_new
+        reward, done, info = self._compute_reward(progress, dist_new, prev_dist, abs(a_left - a_right))
+
+        return obs, reward, done, info
         reward = 8.0 * progress - 0.01
 
         turn_penalty = abs(a_left - a_right)
@@ -523,6 +527,8 @@ class VisionReplayBuffer:
             "proprio": torch.tensor(next_proprio, dtype=torch.float32, device=device),
         }
 
+        action_np = np.stack([b["action"] for b in batch], axis=0)
+        action = torch.tensor(action_np, dtype=torch.float32, device=device)
         action = torch.tensor([b["action"] for b in batch], dtype=torch.float32, device=device)
         reward = torch.tensor([b["reward"] for b in batch], dtype=torch.float32, device=device).unsqueeze(-1)
         done = torch.tensor([b["done"] for b in batch], dtype=torch.float32, device=device).unsqueeze(-1)
