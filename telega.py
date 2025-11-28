@@ -614,6 +614,57 @@ class VisionReplayBuffer:
         }
 
         action_np = np.stack([b["action"] for b in batch], axis=0)
+        reward_np = np.array([b["reward"] for b in batch], dtype=np.float32)
+        done_np = np.array([b["done"] for b in batch], dtype=np.float32)
+
+        action = torch.tensor(action_np, dtype=torch.float32, device=device)
+        reward = torch.tensor(reward_np, dtype=torch.float32, device=device).unsqueeze(-1)
+        done = torch.tensor(done_np, dtype=torch.float32, device=device).unsqueeze(-1)
+
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class VisionReplayBuffer:
+    def __init__(self, capacity: int = 100_000):
+        self.capacity = capacity
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append({
+            "state": {
+                "vision": np.array(state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(state["proprio"], dtype=np.float32, copy=True),
+            },
+            "action": np.array(action, dtype=np.float32, copy=True),
+            "reward": float(reward),
+            "next_state": {
+                "vision": np.array(next_state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(next_state["proprio"], dtype=np.float32, copy=True),
+            },
+            "done": float(done),
+        })
+
+    def sample(self, batch_size: int):
+        batch = random.sample(self.buffer, batch_size)
+
+        vision = np.stack([b["state"]["vision"] for b in batch], axis=0)
+        proprio = np.stack([b["state"]["proprio"] for b in batch], axis=0)
+        next_vision = np.stack([b["next_state"]["vision"] for b in batch], axis=0)
+        next_proprio = np.stack([b["next_state"]["proprio"] for b in batch], axis=0)
+
+        state = {
+            "vision": torch.tensor(vision, dtype=torch.float32, device=device),
+            "proprio": torch.tensor(proprio, dtype=torch.float32, device=device),
+        }
+        next_state = {
+            "vision": torch.tensor(next_vision, dtype=torch.float32, device=device),
+            "proprio": torch.tensor(next_proprio, dtype=torch.float32, device=device),
+        }
+
+        action_np = np.stack([b["action"] for b in batch], axis=0)
         action = torch.tensor(action_np, dtype=torch.float32, device=device)
         action = torch.tensor([b["action"] for b in batch], dtype=torch.float32, device=device)
         reward = torch.tensor([b["reward"] for b in batch], dtype=torch.float32, device=device).unsqueeze(-1)
