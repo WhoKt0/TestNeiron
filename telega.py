@@ -301,9 +301,7 @@ class RobotVisionEnv(RobotEnv):
 
     Наблюдение:
         {
-            "vision": np.ndarray [2 * frame_stack, H, W] (grayscale, 0..1),
-                первые frame_stack кадров — верхняя камера,
-                вторые frame_stack кадров — камера «из глаз».
+            "vision": np.ndarray [frame_stack, H, W] (grayscale, 0..1),
             "proprio": np.ndarray [2] => sin(yaw), cos(yaw)
         }
 
@@ -314,8 +312,8 @@ class RobotVisionEnv(RobotEnv):
         self,
         gui: bool = True,
         max_steps: int = 300,
-        camera_width: int = 84,
-        camera_height: int = 84,
+        camera_width: int = 64,
+        camera_height: int = 64,
         frame_stack: int = 4,
         frame_skip: int = 4,
         grayscale: bool = True,
@@ -325,70 +323,42 @@ class RobotVisionEnv(RobotEnv):
         self.frame_stack = frame_stack
         self.frame_skip = frame_skip
         self.grayscale = grayscale
-        # раздельные стеки кадров: сверху и «из глаз» робота
-        self.frames_top = deque(maxlen=frame_stack)
-        self.frames_front = deque(maxlen=frame_stack)
+        self.frames = deque(maxlen=frame_stack)
 
         super().__init__(gui=gui, max_steps=max_steps)
 
     def reset(self):
         self._load_scene()
-        first_frames = self._render_camera_bundle()
-        self._init_frame_stack(first_frames)
+        first_frame = self._render_camera()
+        self._init_frame_stack(first_frame)
         self._perform_initial_spin()
         self.prev_distance = self._compute_distance_to_target()
         self.no_progress_steps = 0
-        obs, _ = self._compute_obs(latest_frames=None, append=False)
+        obs, _ = self._compute_obs(latest_frame=None, append=False)
+        self.prev_distance = self._compute_distance_to_target()
+        obs, _ = self._compute_obs(latest_frame=first_frame, append=False)
         return obs
 
-    def _init_frame_stack(self, first_frames: dict):
-        self.frames_top.clear()
-        self.frames_front.clear()
+    def _init_frame_stack(self, first_frame: np.ndarray):
+        self.frames.clear()
         for _ in range(self.frame_stack):
-            self.frames_top.append(first_frames["top"])
-            self.frames_front.append(first_frames["front"])
+            self.frames.append(first_frame)
 
-    def _render_camera(self, camera: str) -> np.ndarray:
-        if camera == "top":
-            cam_target = [self.x, self.y, 0.0]
-            cam_distance = 4.2
-            cam_height = 4.8
-            view_matrix = p.computeViewMatrix(
-                cameraEyePosition=[self.x, self.y - cam_distance, cam_height],
-                cameraTargetPosition=cam_target,
-                cameraUpVector=[0, 0, 1],
-            )
-            projection_matrix = p.computeProjectionMatrixFOV(
-                fov=100,
-                aspect=self.camera_width / self.camera_height,
-                nearVal=0.05,
-                farVal=12.0,
-            )
-        elif camera == "front":
-            forward = [math.cos(self.yaw), math.sin(self.yaw), 0.0]
-            eye = [
-                self.x + 0.3 * forward[0],
-                self.y + 0.3 * forward[1],
-                0.35,
-            ]
-            target = [
-                self.x + 1.2 * forward[0],
-                self.y + 1.2 * forward[1],
-                0.1,
-            ]
-            view_matrix = p.computeViewMatrix(
-                cameraEyePosition=eye,
-                cameraTargetPosition=target,
-                cameraUpVector=[0, 0, 1],
-            )
-            projection_matrix = p.computeProjectionMatrixFOV(
-                fov=95,
-                aspect=self.camera_width / self.camera_height,
-                nearVal=0.02,
-                farVal=6.0,
-            )
-        else:
-            raise ValueError(f"Неизвестная камера: {camera}")
+    def _render_camera(self) -> np.ndarray:
+        cam_target = [self.x, self.y, 0.0]
+        cam_distance = 3.5
+        cam_height = 3.5
+        view_matrix = p.computeViewMatrix(
+            cameraEyePosition=[self.x, self.y - cam_distance, cam_height],
+            cameraTargetPosition=cam_target,
+            cameraUpVector=[0, 0, 1],
+        )
+        projection_matrix = p.computeProjectionMatrixFOV(
+            fov=60,
+            aspect=self.camera_width / self.camera_height,
+            nearVal=0.1,
+            farVal=10.0,
+        )
 
         renderer = p.ER_BULLET_HARDWARE_OPENGL if self.gui else p.ER_TINY_RENDERER
         width, height, rgba, _, _ = p.getCameraImage(
@@ -406,9 +376,6 @@ class RobotVisionEnv(RobotEnv):
         else:
             frame = rgb / 255.0
         return frame.astype(np.float32)
-
-    def _render_camera_bundle(self) -> dict:
-        return {"top": self._render_camera("top"), "front": self._render_camera("front")}
 
     def _perform_initial_spin(self):
         """Повернуть камеру на 360° перед тем, как агент начнёт действовать."""
@@ -428,9 +395,7 @@ class RobotVisionEnv(RobotEnv):
                 physicsClientId=self.client,
             )
             p.stepSimulation(physicsClientId=self.client)
-            frames = self._render_camera_bundle()
-            self.frames_top.append(frames["top"])
-            self.frames_front.append(frames["front"])
+            self.frames.append(self._render_camera())
 
         # Вернуться к исходной ориентации
         self.yaw = start_yaw
@@ -443,23 +408,13 @@ class RobotVisionEnv(RobotEnv):
             physicsClientId=self.client,
         )
         p.stepSimulation(physicsClientId=self.client)
-        frames = self._render_camera_bundle()
-        self.frames_top.append(frames["top"])
-        self.frames_front.append(frames["front"])
+        self.frames.append(self._render_camera())
 
-    def _compute_obs(self, latest_frames: Optional[dict] = None, append: bool = True):
-        if latest_frames is not None:
-            frames = latest_frames
-        elif append:
-            frames = self._render_camera_bundle()
-        else:
-            frames = {"top": self.frames_top[-1], "front": self.frames_front[-1]}
+    def _compute_obs(self, latest_frame: Optional[np.ndarray] = None, append: bool = True):
+        frame = latest_frame if latest_frame is not None else self._render_camera()
         if append:
-            self.frames_top.append(frames["top"])
-            self.frames_front.append(frames["front"])
-        stacked_top = np.stack(self.frames_top, axis=0)
-        stacked_front = np.stack(self.frames_front, axis=0)
-        stacked = np.concatenate([stacked_top, stacked_front], axis=0)
+            self.frames.append(frame)
+        stacked = np.stack(self.frames, axis=0)
         proprio = np.array([
             math.sin(self.yaw),
             math.cos(self.yaw),
@@ -507,8 +462,8 @@ class RobotVisionEnv(RobotEnv):
         if self.gui:
             p.configureDebugVisualizer(p.COV_ENABLE_SINGLE_STEP_RENDERING)
 
-        new_frames = self._render_camera_bundle()
-        obs, dist_new = self._compute_obs(latest_frames=new_frames, append=True)
+        new_frame = self._render_camera()
+        obs, dist_new = self._compute_obs(latest_frame=new_frame, append=True)
 
         prev_dist = self.prev_distance
         self.prev_distance = dist_new
@@ -517,49 +472,28 @@ class RobotVisionEnv(RobotEnv):
         reward, done, info = self._compute_reward(progress, dist_new, prev_dist, abs(a_left - a_right))
 
         return obs, reward, done, info
+        reward = 8.0 * progress - 0.01
 
-    def _compute_reward(self, progress: float, dist_new: float, prev_dist: float, turning_gap: float):
-        """Полная копия шейпера награды без обращения к ``super()``.
-
-        В некоторых сборках «super» неожиданно терял ссылку на базовый
-        метод после мерджей, поэтому здесь дублируется логика RobotEnv.
-        Если захочется тонко настроить визуальную награду — менять именно
-        здесь, не трогая базовый класс.
-        """
-
-        # Денс за движение к цели
-        reward = 6.0 * progress
-
-        # Маленький штраф за время
-        reward -= 0.01
-
-        # Накапливаем штраф за отсутствие прогресса (борьба с "застрял и повторяю")
-        if progress < 0.005:
-            self.no_progress_steps += 1
-        else:
-            self.no_progress_steps = 0
-        reward -= 0.02 * min(self.no_progress_steps, 50)
-
-        # Штраф за заметное удаление от цели
-        if dist_new > prev_dist + 0.02:
-            reward -= 0.4
-
-        # Лёгкий штраф за сильное вращение на месте
-        reward -= 0.0007 * turning_gap
+        turn_penalty = abs(a_left - a_right)
+        reward -= 0.0005 * turn_penalty
 
         done = False
-        info = {"success": False}
+        info = {}
 
-        # Финальный бонус за достижение цели
-        if dist_new < 0.35:
-            reward += 60.0
+        if dist_new - prev_dist > 0.03:
+            reward -= 0.5
+
+        if dist_new < 0.4:
+            reward += 50.0
             done = True
             info["success"] = True
+        else:
+            info["success"] = False
 
         if self.step_count >= self.max_steps:
             done = True
 
-        return float(reward), done, info
+        return obs, float(reward), done, info
 
 class ReplayBuffer:
     def __init__(self, capacity: int = 200_000):
@@ -635,6 +569,106 @@ class VisionReplayBuffer:
         action = torch.tensor(action_np, dtype=torch.float32, device=device)
         reward = torch.tensor(reward_np, dtype=torch.float32, device=device).unsqueeze(-1)
         done = torch.tensor(done_np, dtype=torch.float32, device=device).unsqueeze(-1)
+
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class VisionReplayBuffer:
+    def __init__(self, capacity: int = 100_000):
+        self.capacity = capacity
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append({
+            "state": {
+                "vision": np.array(state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(state["proprio"], dtype=np.float32, copy=True),
+            },
+            "action": np.array(action, dtype=np.float32, copy=True),
+            "reward": float(reward),
+            "next_state": {
+                "vision": np.array(next_state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(next_state["proprio"], dtype=np.float32, copy=True),
+            },
+            "done": float(done),
+        })
+
+    def sample(self, batch_size: int):
+        batch = random.sample(self.buffer, batch_size)
+
+        vision = np.stack([b["state"]["vision"] for b in batch], axis=0)
+        proprio = np.stack([b["state"]["proprio"] for b in batch], axis=0)
+        next_vision = np.stack([b["next_state"]["vision"] for b in batch], axis=0)
+        next_proprio = np.stack([b["next_state"]["proprio"] for b in batch], axis=0)
+
+        state = {
+            "vision": torch.tensor(vision, dtype=torch.float32, device=device),
+            "proprio": torch.tensor(proprio, dtype=torch.float32, device=device),
+        }
+        next_state = {
+            "vision": torch.tensor(next_vision, dtype=torch.float32, device=device),
+            "proprio": torch.tensor(next_proprio, dtype=torch.float32, device=device),
+        }
+
+        action_np = np.stack([b["action"] for b in batch], axis=0)
+        reward_np = np.array([b["reward"] for b in batch], dtype=np.float32)
+        done_np = np.array([b["done"] for b in batch], dtype=np.float32)
+
+        action = torch.tensor(action_np, dtype=torch.float32, device=device)
+        reward = torch.tensor(reward_np, dtype=torch.float32, device=device).unsqueeze(-1)
+        done = torch.tensor(done_np, dtype=torch.float32, device=device).unsqueeze(-1)
+
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class VisionReplayBuffer:
+    def __init__(self, capacity: int = 100_000):
+        self.capacity = capacity
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append({
+            "state": {
+                "vision": np.array(state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(state["proprio"], dtype=np.float32, copy=True),
+            },
+            "action": np.array(action, dtype=np.float32, copy=True),
+            "reward": float(reward),
+            "next_state": {
+                "vision": np.array(next_state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(next_state["proprio"], dtype=np.float32, copy=True),
+            },
+            "done": float(done),
+        })
+
+    def sample(self, batch_size: int):
+        batch = random.sample(self.buffer, batch_size)
+
+        vision = np.stack([b["state"]["vision"] for b in batch], axis=0)
+        proprio = np.stack([b["state"]["proprio"] for b in batch], axis=0)
+        next_vision = np.stack([b["next_state"]["vision"] for b in batch], axis=0)
+        next_proprio = np.stack([b["next_state"]["proprio"] for b in batch], axis=0)
+
+        state = {
+            "vision": torch.tensor(vision, dtype=torch.float32, device=device),
+            "proprio": torch.tensor(proprio, dtype=torch.float32, device=device),
+        }
+        next_state = {
+            "vision": torch.tensor(next_vision, dtype=torch.float32, device=device),
+            "proprio": torch.tensor(next_proprio, dtype=torch.float32, device=device),
+        }
+
+        action_np = np.stack([b["action"] for b in batch], axis=0)
+        action = torch.tensor(action_np, dtype=torch.float32, device=device)
+        action = torch.tensor([b["action"] for b in batch], dtype=torch.float32, device=device)
+        reward = torch.tensor([b["reward"] for b in batch], dtype=torch.float32, device=device).unsqueeze(-1)
+        done = torch.tensor([b["done"] for b in batch], dtype=torch.float32, device=device).unsqueeze(-1)
 
         return state, action, reward, next_state, done
 
