@@ -1,20 +1,21 @@
 import time
 import torch
-from telega import RobotEnv, SACAgent
+from telega import RobotVisionEnv, VisionSACAgent
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def visualize_trained(max_steps=300, episodes=30):
-    print("Загружаю модель telega_sac_agent.pt (готовую модель)...")
-    checkpoint = torch.load("telega_sac_agent.pt", map_location=DEVICE)
+def visualize_trained(model_path="telega_pixel_agent.pt", max_steps=300, episodes=10):
+    print(f"Загружаю модель {model_path} (пиксельная политика)...")
+    checkpoint = torch.load(model_path, map_location=DEVICE)
 
-    env = RobotEnv(gui=True, max_steps=max_steps)
+    env = RobotVisionEnv(gui=True, max_steps=max_steps)
+    state = env.reset()
 
-
-    state_dim = 7
+    vision_channels = state["vision"].shape[0]
+    proprio_dim = state["proprio"].shape[0]
     action_dim = 2
-    agent = SACAgent(state_dim, action_dim)
+    agent = VisionSACAgent(vision_channels, proprio_dim, action_dim)
 
     agent.policy.load_state_dict(checkpoint["policy"])
 
@@ -23,14 +24,13 @@ def visualize_trained(max_steps=300, episodes=30):
         total_reward = 0.0
         episode_success = False
 
-        for t in range(max_steps):
+        for _ in range(max_steps):
             action = agent.select_action(state, evaluate=True)
             state, reward, done, info = env.step(action)
             total_reward += reward
             if info.get("success", False):
                 episode_success = True
 
-            # чуть притормозить, чтобы глазом успевать
             time.sleep(env.sim_dt)
 
             if done:
@@ -44,4 +44,4 @@ def visualize_trained(max_steps=300, episodes=30):
 
 
 if __name__ == "__main__":
-    visualize_trained(episodes=30)
+    visualize_trained(episodes=10)
