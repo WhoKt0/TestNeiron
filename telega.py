@@ -357,12 +357,13 @@ class RobotVisionEnv(RobotEnv):
             farVal=10.0,
         )
 
+        renderer = p.ER_BULLET_HARDWARE_OPENGL if self.gui else p.ER_TINY_RENDERER
         width, height, rgba, _, _ = p.getCameraImage(
             width=self.camera_width,
             height=self.camera_height,
             viewMatrix=view_matrix,
             projectionMatrix=projection_matrix,
-            renderer=p.ER_BULLET_HARDWARE_OPENGL,
+            renderer=renderer,
             physicsClientId=self.client,
         )
 
@@ -492,10 +493,16 @@ class VisionReplayBuffer:
 
     def push(self, state, action, reward, next_state, done):
         self.buffer.append({
-            "state": state,
-            "action": np.array(action, dtype=np.float32),
+            "state": {
+                "vision": np.array(state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(state["proprio"], dtype=np.float32, copy=True),
+            },
+            "action": np.array(action, dtype=np.float32, copy=True),
             "reward": float(reward),
-            "next_state": next_state,
+            "next_state": {
+                "vision": np.array(next_state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(next_state["proprio"], dtype=np.float32, copy=True),
+            },
             "done": float(done),
         })
 
@@ -589,10 +596,11 @@ class VisionEncoder(nn.Module):
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
         )
 
-        # выход после conv для 64x64: 64 * 4 * 4 = 1024
+        # фиксируем выход фичей в 4x4 даже для других размеров кадра
         self.fc = nn.Sequential(
             nn.Linear(1024 + proprio_dim, feature_dim),
             nn.ReLU(),
