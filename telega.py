@@ -335,6 +335,8 @@ class RobotVisionEnv(RobotEnv):
         self.prev_distance = self._compute_distance_to_target()
         self.no_progress_steps = 0
         obs, _ = self._compute_obs(latest_frame=None, append=False)
+        self.prev_distance = self._compute_distance_to_target()
+        obs, _ = self._compute_obs(latest_frame=first_frame, append=False)
         return obs
 
     def _init_frame_stack(self, first_frame: np.ndarray):
@@ -470,49 +472,28 @@ class RobotVisionEnv(RobotEnv):
         reward, done, info = self._compute_reward(progress, dist_new, prev_dist, abs(a_left - a_right))
 
         return obs, reward, done, info
+        reward = 8.0 * progress - 0.01
 
-    def _compute_reward(self, progress: float, dist_new: float, prev_dist: float, turning_gap: float):
-        """Полная копия шейпера награды без обращения к ``super()``.
-
-        В некоторых сборках «super» неожиданно терял ссылку на базовый
-        метод после мерджей, поэтому здесь дублируется логика RobotEnv.
-        Если захочется тонко настроить визуальную награду — менять именно
-        здесь, не трогая базовый класс.
-        """
-
-        # Денс за движение к цели
-        reward = 6.0 * progress
-
-        # Маленький штраф за время
-        reward -= 0.01
-
-        # Накапливаем штраф за отсутствие прогресса (борьба с "застрял и повторяю")
-        if progress < 0.005:
-            self.no_progress_steps += 1
-        else:
-            self.no_progress_steps = 0
-        reward -= 0.02 * min(self.no_progress_steps, 50)
-
-        # Штраф за заметное удаление от цели
-        if dist_new > prev_dist + 0.02:
-            reward -= 0.4
-
-        # Лёгкий штраф за сильное вращение на месте
-        reward -= 0.0007 * turning_gap
+        turn_penalty = abs(a_left - a_right)
+        reward -= 0.0005 * turn_penalty
 
         done = False
-        info = {"success": False}
+        info = {}
 
-        # Финальный бонус за достижение цели
-        if dist_new < 0.35:
-            reward += 60.0
+        if dist_new - prev_dist > 0.03:
+            reward -= 0.5
+
+        if dist_new < 0.4:
+            reward += 50.0
             done = True
             info["success"] = True
+        else:
+            info["success"] = False
 
         if self.step_count >= self.max_steps:
             done = True
 
-        return float(reward), done, info
+        return obs, float(reward), done, info
 
 class ReplayBuffer:
     def __init__(self, capacity: int = 200_000):
@@ -588,6 +569,55 @@ class VisionReplayBuffer:
         action = torch.tensor(action_np, dtype=torch.float32, device=device)
         reward = torch.tensor(reward_np, dtype=torch.float32, device=device).unsqueeze(-1)
         done = torch.tensor(done_np, dtype=torch.float32, device=device).unsqueeze(-1)
+
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class VisionReplayBuffer:
+    def __init__(self, capacity: int = 100_000):
+        self.capacity = capacity
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append({
+            "state": {
+                "vision": np.array(state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(state["proprio"], dtype=np.float32, copy=True),
+            },
+            "action": np.array(action, dtype=np.float32, copy=True),
+            "reward": float(reward),
+            "next_state": {
+                "vision": np.array(next_state["vision"], dtype=np.float32, copy=True),
+                "proprio": np.array(next_state["proprio"], dtype=np.float32, copy=True),
+            },
+            "done": float(done),
+        })
+
+    def sample(self, batch_size: int):
+        batch = random.sample(self.buffer, batch_size)
+
+        vision = np.stack([b["state"]["vision"] for b in batch], axis=0)
+        proprio = np.stack([b["state"]["proprio"] for b in batch], axis=0)
+        next_vision = np.stack([b["next_state"]["vision"] for b in batch], axis=0)
+        next_proprio = np.stack([b["next_state"]["proprio"] for b in batch], axis=0)
+
+        state = {
+            "vision": torch.tensor(vision, dtype=torch.float32, device=device),
+            "proprio": torch.tensor(proprio, dtype=torch.float32, device=device),
+        }
+        next_state = {
+            "vision": torch.tensor(next_vision, dtype=torch.float32, device=device),
+            "proprio": torch.tensor(next_proprio, dtype=torch.float32, device=device),
+        }
+
+        action_np = np.stack([b["action"] for b in batch], axis=0)
+        action = torch.tensor(action_np, dtype=torch.float32, device=device)
+        action = torch.tensor([b["action"] for b in batch], dtype=torch.float32, device=device)
+        reward = torch.tensor([b["reward"] for b in batch], dtype=torch.float32, device=device).unsqueeze(-1)
+        done = torch.tensor([b["done"] for b in batch], dtype=torch.float32, device=device).unsqueeze(-1)
 
         return state, action, reward, next_state, done
 
